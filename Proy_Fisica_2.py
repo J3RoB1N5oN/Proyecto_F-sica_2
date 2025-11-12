@@ -9,10 +9,10 @@ import pandas as pd
 # !! IMPORTANTE: Asegúrate de que la ruta del video sea correcta !!
 #Local:
 video_path = 'c:/Users/julio/Documents/Codes Unsta Laptop/Fisica II files/VideoRecortado.mp4'
+csv_path = 'c:/Users/julio/Documents/Codes Unsta Laptop/Fisica II files/voltaje_resultados.csv'
 #Drive:
 # video_path = 'g:/Otros ordenadores/Asus Laptop/Codes Unsta Laptop/Fisica II files/VideoRecortado.mp4'
-
-csv_path = 'c:/Users/julio/Documents/Codes Unsta Laptop/Fisica II files/voltaje_resultados.csv'
+# csv_path = 'g:/Otros ordenadores/Asus Laptop/Codes Unsta Laptop/Fisica II files/voltaje_resultados.csv'
 
 cap = cv2.VideoCapture(video_path)
 
@@ -139,7 +139,6 @@ def on_tolerance_trackbar(val):
 
 def analyze_white_cluster_in_fixed_roi(frame_to_analyze, roi_coords, final_lower_hsv, final_upper_hsv):
     """
-    (Portado de PFis2.py)
     Analiza una mancha dentro de una ROI fija en un solo fotograma,
     usando los rangos HSV calculados por el usuario.
     Retorna el centroide, área, contorno y la imagen segmentada.
@@ -198,7 +197,6 @@ def analyze_white_cluster_in_fixed_roi(frame_to_analyze, roi_coords, final_lower
 
 def calculate_angle(center, point):
     """ 
-    (Portado de PFis2.py)
     Calcula el ángulo en radianes entre el centro y un punto dado. 
     """
     if center is None or point is None:
@@ -211,7 +209,6 @@ def calculate_angle(center, point):
 
 def calculate_angular_velocity(angles, times):
     """ 
-    (Portado de PFis2.py)
     Calcula la velocidad angular (rad/s) entre los dos últimos puntos.
     """
     if len(angles) < 2 or len(times) < 2:
@@ -231,28 +228,37 @@ def calculate_angular_velocity(angles, times):
     
     return delta_angle / delta_time
 
-# --- Función de Seguimiento Automático ---
+# --- Función de Seguimiento Automático (CORREGIDA CON MÉTODO DE PERÍODO) ---
 def seguimiento_automatico():
     """
-    (Lógica adaptada de PFis2.py, Fase 4)
     Esta función se llama al presionar 'e'.
-    Analiza el video completo, calcula la velocidad y muestra el gráfico.
+    Analiza el video completo, calcula la velocidad (usando el método de PERÍODO) 
+    y muestra el gráfico.
     """
     global cap, fps, total_frames
     global centro_rotacion, roi_seleccionada, lower_white, upper_white
     global puntos_ciclo_actual, df_voltaje 
 
-    print("\n--- INICIANDO FASE DE ANÁLISIS AUTOMÁTICO ---")
+    print("\n--- INICIANDO FASE DE ANÁLISIS AUTOMÁTICO (POR PERÍODO) ---")
     print("   (Presione 'ESPACIO' para pausar, 'q' para cancelar)")
 
     # 1. Resetear historiales y video
-    centroids_history = []
-    frame_times_history = [] 
-    angles_history = [] 
-    angular_velocities_history = []
+    
+    # (Las listas de historial por frame ya no son necesarias para el cálculo de RPM)
+    
     voltages_for_plot = []
-    puntos_ciclo_actual = {} # Limpiar puntos previos
+    
+    # --- NUEVAS VARIABLES PARA CÁLCULO POR PERÍODO ---
+    rpm_history_periodic = []     # Historial de RPM (una entrada por CADA VUELTA)
+    rpm_times_periodic = []       # Tiempo en el que se completó esa vuelta
+    last_angle_for_period = None  # El ángulo del frame anterior
+    last_time_at_crossing = None  # El tiempo (en seg) del último "cruce por cero"
+    
+    # Lista para acumular voltajes DURANTE la vuelta actual
+    voltages_in_current_period = [] 
+    # --------------------------------------------------
 
+    puntos_ciclo_actual = {} # Limpiar puntos previos
     MIN_PIXEL_DISTANCE = 25
     
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0) # Rebobinar video
@@ -277,7 +283,6 @@ def seguimiento_automatico():
             )
 
             frame_display = frame.copy()
-            angular_velocity = 0.0
 
             # 5. Si se detecta la mancha
             if centroid:
@@ -286,9 +291,7 @@ def seguimiento_automatico():
                 if distancia_al_centro > MIN_PIXEL_DISTANCE:
                 
                     puntos_ciclo_actual[current_frame_num] = centroid # Guardar para dibujar
-                    centroids_history.append(centroid)
-                    frame_times_history.append(frame_time)
-
+                    
                     # Dibujar contorno y centroide
                     if largest_contour is not None:
                         cv2.drawContours(frame_display, [largest_contour], -1, (0, 255, 0), 2)
@@ -296,26 +299,60 @@ def seguimiento_automatico():
 
                     # Calcular ángulo (Usando Paso 4)
                     angle_rad = calculate_angle(centro_rotacion, centroid)
-                    if angle_rad is not None:
-                        angles_history.append(angle_rad)
-
-                    # Calcular velocidad angular (Usando Paso 4)
-                    if len(angles_history) >= 2:
-                        angular_velocity = calculate_angular_velocity(angles_history, frame_times_history)
-                        angular_velocities_history.append(angular_velocity)
-
-                        if df_voltaje is not None:
-                                try:
-                                    # Buscar voltaje por número de frame
-                                    voltage = df_voltaje.iloc[current_frame_num]['valor_display']
-                                    voltages_for_plot.append(voltage)
-                                except IndexError:
-                                    # Ocurre si el video es más largo que el CSV
-                                    voltages_for_plot.append(np.nan) # np.nan es mejor que 0
-                        else:
-                                # Ocurre si el CSV no se cargó
-                                voltages_for_plot.append(np.nan)
                     
+                    if angle_rad is not None:
+                        
+                        # --- INICIO: LÓGICA DE PERÍODO (T) ---
+                        
+                        # 1. Acumular el voltaje de este frame (si existe)
+                        current_voltage = np.nan
+                        if df_voltaje is not None:
+                            try:
+                                current_voltage = df_voltaje.iloc[current_frame_num]['valor_display']
+                                voltages_in_current_period.append(current_voltage)
+                            except IndexError:
+                                pass
+
+                        # 2. Comprobar si hemos cruzado el eje horizontal (de negativo a positivo)
+                        #    (Usamos un umbral pequeño como -0.5 rad para evitar ruido cerca de 0)
+                        if last_angle_for_period is not None:
+                            if last_angle_for_period < -0.5 and angle_rad >= -0.5:
+                                
+                                # ¡VUELTA COMPLETA DETECTADA!
+                                
+                                # Solo calculamos si YA tenemos una marca de tiempo anterior
+                                if last_time_at_crossing is not None:
+                                    
+                                    # Calcular el Período (T)
+                                    period_T = frame_time - last_time_at_crossing
+                                    
+                                    if period_T > 0: # Evitar división por cero
+                                        
+                                        # Calcular RPM (RPM = 60 / T)
+                                        rpm = 60.0 / period_T
+                                        rpm_history_periodic.append(rpm)
+                                        
+                                        # Guardar el tiempo en el que se midió
+                                        rpm_times_periodic.append(frame_time)
+                                        
+                                        # Calcular el voltaje PROMEDIO de esa vuelta
+                                        if voltages_in_current_period:
+                                            avg_voltage = np.nanmean(voltages_in_current_period)
+                                            voltages_for_plot.append(avg_voltage)
+                                        else:
+                                            voltages_for_plot.append(np.nan)
+                                        
+                                        # Reiniciar el acumulador de voltaje
+                                        voltages_in_current_period = []
+
+                                # Actualizar la marca de tiempo del último cruce
+                                last_time_at_crossing = frame_time
+                        
+                        # 3. Actualizar el ángulo anterior para el siguiente frame
+                        last_angle_for_period = angle_rad
+                        
+                        # --- FIN: LÓGICA DE PERÍODO (T) ---
+
             # 6. Dibujar información en pantalla
             if centro_rotacion:
                 cv2.circle(frame_display, centro_rotacion, 7, (0, 255, 0), -1)
@@ -325,16 +362,15 @@ def seguimiento_automatico():
             cv2.putText(frame_display, f"Procesando: {current_frame_num}/{total_frames}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
             cv2.putText(frame_display, "Presione 'ESPACIO' para PAUSA, 'q' para SALIR", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
             
-            # Mostrar RPM (w * 60 / 2*pi)
-            rpm = abs(angular_velocity * 9.5493) 
-            cv2.putText(frame_display, f"Velocidad: {rpm:.2f} RPM", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            # Mostrar la ÚLTIMA RPM medida (será más estable)
+            rpm_display = rpm_history_periodic[-1] if rpm_history_periodic else 0.0
+            cv2.putText(frame_display, f"Velocidad (Periodo): {rpm_display:.2f} RPM", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
             cv2.imshow("Visor de video", frame_display)
 
         # 7. Manejo de Teclas (Pausa y Salir)
-        # (Usamos un delay bajo para que el video corra rápido, 
-        # o 0 si está en pausa para que espere)
-        delay = 0 if is_paused else int(1000 / fps) # Delay para velocidad normal
+        # (El resto del bucle de teclas 'q', ' ', 'a', 'd' es idéntico)
+        delay = 0 if is_paused else int(1000 / fps) 
         if delay <= 0:
             delay = 1
             
@@ -344,7 +380,7 @@ def seguimiento_automatico():
             print("--- Análisis cancelado por el usuario. ---")
             break
         
-        elif key == ord(' '): # ESPACIO para pausar
+        elif key == ord(' '): 
             is_paused = not is_paused
             if is_paused:
                 print(f"--- PAUSA en frame {current_frame_num}. Use 'a'/'d' para navegar, 'ESPACIO' para continuar. ---")
@@ -352,68 +388,54 @@ def seguimiento_automatico():
                 print("--- Reanudando análisis. ---")
                 
         elif is_paused and (key == ord('a') or key == ord('d')):
-            # --- INICIO: Lógica de navegación en pausa ---
-            
-            # 1. Calcular nuevo frame
-            if key == ord('a'): # Frame anterior
+            if key == ord('a'): 
                 current_frame_num = max(current_frame_num - 1, 0)
-            elif key == ord('d'): # Frame siguiente
+            elif key == ord('d'): 
                 current_frame_num = min(current_frame_num + 1, total_frames - 1)
             
-            # 2. Cargar ese frame específico
             cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame_num)
             ret, frame = cap.read()
             if not ret:
-                print(f"Error al leer frame {current_frame_num} en modo pausa.")
                 continue
 
             frame_display = frame.copy()
-
-            # 3. Volver a dibujar los marcadores estáticos y el punto guardado
             if centro_rotacion:
                 cv2.circle(frame_display, centro_rotacion, 7, (0, 255, 0), -1)
             if roi_seleccionada:
                 cv2.rectangle(frame_display, (roi_seleccionada[0], roi_seleccionada[1]), (roi_seleccionada[2], roi_seleccionada[3]), (0, 255, 255), 2)
             
-            # Buscar si tenemos un punto guardado para este frame
             if current_frame_num in puntos_ciclo_actual:
                 centroid_guardado = puntos_ciclo_actual[current_frame_num]
                 cv2.circle(frame_display, centroid_guardado, 5, (0, 0, 255), -1)
                 if centro_rotacion:
                     cv2.line(frame_display, centro_rotacion, centroid_guardado, (255, 255, 0), 1)
 
-            # 4. Actualizar texto en pantalla
             cv2.putText(frame_display, f"PAUSADO (Navegando): {current_frame_num}/{total_frames}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
             cv2.putText(frame_display, "Use 'a'/'d'. 'ESPACIO' para reanudar, 'q' para SALIR", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-            
-            # (No mostramos RPM pues no estamos calculando)
             cv2.imshow("Visor de video", frame_display)     
 
-# FIN DEL BUCLE: CÁLCULO FINAL Y GRÁFICO
+    # --- FIN DEL BUCLE: CÁLCULO FINAL Y GRÁFICO (MODIFICADO) ---
     print("--- ANÁLIS FINALIZADO ---")
     
-    if angular_velocities_history:
+    # (Modificamos el 'if' para que use la nueva lista)
+    if rpm_history_periodic:
         # Calcular promedio
-        average_angular_velocity_rad_s = np.mean(angular_velocities_history)
-        average_rpm = abs(average_angular_velocity_rad_s * 9.5493) # 60 / 2*pi
+        average_rpm = np.mean(rpm_history_periodic) # Cálculo más directo
 
-        print(f"\n--- RESULTADOS DEL ANÁLISIS ---")
-        print(f"Puntos analizados: {len(angular_velocities_history)}")
-        print(f"Velocidad Angular Promedio: {abs(average_angular_velocity_rad_s):.2f} rad/s")
+        print(f"\n--- RESULTADOS DEL ANÁLISIS (POR PERÍODO) ---")
+        print(f"Vueltas completas analizadas: {len(rpm_history_periodic)}")
         print(f"Velocidad de Giro Promedio: {average_rpm:.2f} RPM")
 
         # 9. GENERACIÓN DEL GRÁFICO (RPM vs Tiempo)
         
-        # --- CAMBIO 1: Ponerle nombre a la Ventana 1 ---
-        plt.figure(num="Figura 1: RPM vs. Tiempo", figsize=(10, 6))
+        plt.figure(num="Figura 1: RPM vs. Tiempo (Por Periodo)", figsize=(10, 6))
         
-        # Graficamos RPM vs Tiempo
-        rpms_history = np.abs(np.array(angular_velocities_history) * 9.5493)
-        # Asegurarse de que los tiempos coincidan (historial de velocidad empieza en el 2do frame)
-        times_plot = frame_times_history[1:len(rpms_history)+1] 
+        times_plot = rpm_times_periodic
+        rpms_plot = rpm_history_periodic
         
-        plt.plot(times_plot, rpms_history, marker='o', linestyle='-', color='b', markersize=2)
-        plt.title('Velocidad (RPM) en Función del Tiempo')
+        # (Graficamos los puntos por período)
+        plt.plot(times_plot, rpms_plot, marker='o', linestyle='-', color='b', markersize=4)
+        plt.title('Velocidad (RPM) en Función del Tiempo (Medición por Período)')
         plt.xlabel('Tiempo (s)')
         plt.ylabel('Velocidad de Giro (RPM)')
         plt.grid(True)
@@ -421,20 +443,22 @@ def seguimiento_automatico():
         plt.legend()
 
         # --- INICIO: NUEVO GRÁFICO (RPM vs Voltaje) ---
-        if voltages_for_plot and rpms_history.size == len(voltages_for_plot):
+        
+        # (La lógica de ploteo es la misma, pero ahora usa los datos promediados por período)
+        if voltages_for_plot and len(rpms_plot) == len(voltages_for_plot):
             
-            # --- Ventana 2 ---
-            plt.figure(num="Figura 2: RPM vs. Voltaje", figsize=(10, 6)) # Nueva figura
+            plt.figure(num="Figura 2: RPM vs. Voltaje (Por Periodo)", figsize=(10, 6)) 
             
             v_data = np.array(voltages_for_plot)
-            rpm_data = rpms_history
+            rpm_data = np.array(rpms_plot) # Usamos los datos de RPM por período
 
             valid_indices = ~np.isnan(v_data) & ~np.isnan(rpm_data)
             v_clean = v_data[valid_indices]
             rpm_clean = rpm_data[valid_indices]
 
             if v_clean.size > 1:
-                plt.scatter(v_clean, rpm_clean, alpha=0.5, s=10, label="Datos (frame-a-frame)")
+                # (Hacemos los puntos un poco más grandes para que se vean)
+                plt.scatter(v_clean, rpm_clean, alpha=0.7, s=20, label="Datos (Promedio por Vuelta)")
                 
                 try:
                     model = np.polyfit(v_clean, rpm_clean, 1)
@@ -446,8 +470,8 @@ def seguimiento_automatico():
                 except Exception as e:
                     print(f"No se pudo calcular la línea de tendencia: {e}")
 
-                plt.title('Velocidad (RPM) en Función del Voltaje')
-                plt.xlabel('Voltaje (V)')
+                plt.title('Velocidad (RPM) en Función del Voltaje (Promedio por Vuelta)')
+                plt.xlabel('Voltaje Promedio del Período (V)')
                 plt.ylabel('Velocidad de Giro (RPM)')
                 plt.grid(True)
                 plt.legend()
@@ -458,9 +482,8 @@ def seguimiento_automatico():
         elif not voltages_for_plot:
             print("No se generó el gráfico de Voltaje vs RPM (CSV no cargado o sin datos).")
         else:
-            print(f"Error de coincidencia de datos: RPMs ({rpms_history.size}) vs Voltajes ({len(voltages_for_plot)})")
+            print(f"Error de coincidencia de datos: RPMs ({len(rpms_plot)}) vs Voltajes ({len(voltages_for_plot)})")
         
-        # --- CAMBIO 4: Se llama a plt.show() UNA SOLA VEZ AL FINAL ---
         print("Mostrando resultados. Cierre las ventanas de gráficos para continuar.")
         plt.show() 
     
